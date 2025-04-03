@@ -4,7 +4,7 @@ import io
 import logging
 import wave
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable # Added Iterable
 
 from flask import Flask, request
 
@@ -91,7 +91,10 @@ def main() -> None:
 
     # Load voice
     voice = PiperVoice.load(args.model, config_path=args.config, use_cuda=args.cuda)
-    synthesize_args = {
+    
+    # Store synthesis args default values from command line or Piper defaults
+    # Allow overriding via request parameters later if desired
+    synthesis_defaults = {
         "speaker_id": args.speaker,
         "length_scale": args.length_scale,
         "noise_scale": args.noise_scale,
@@ -102,55 +105,97 @@ def main() -> None:
     # Create web server
     app = Flask(__name__)
 
-    def generate_audio_stream(text: str):
-        """Generate streaming audio response."""
-        # Start with WAV header
-        with io.BytesIO() as wav_io:
-            with wave.open(wav_io, "wb") as wav_file:
-                wav_file.setframerate(voice.config.sample_rate)
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setnchannels(1)  # mono
-                wav_file.writeframes(b"")  # Write empty frames to generate header
-            yield wav_io.getvalue()
-        
-        # Stream audio data
+    def generate_pcm_stream(text: str, synthesize_args: Dict[str, Any]) -> Iterable[bytes]:
+        """Generate streaming raw PCM audio response."""
+        # Stream raw audio data directly from the voice model
+        # The synthesize_stream_raw method already yields bytes (raw PCM S16LE)
         for audio_bytes in voice.synthesize_stream_raw(text, **synthesize_args):
             yield audio_bytes
 
     @app.route("/", methods=["GET", "POST"])
     def app_synthesize() -> bytes:
+        """Synthesize audio to a complete WAV file."""
         if request.method == "POST":
-            text = request.data.decode("utf-8")
-        else:
+            # Prefer JSON body for POST for easier parameter passing
+            if request.is_json:
+                data = request.get_json()
+                text = data.get("text", "")
+                # Allow overriding synthesis parameters via JSON
+                req_args = {k: data.get(k) for k in synthesis_defaults if k in data}
+            else:
+                text = request.data.decode("utf-8")
+                req_args = {} # No overrides from plain text body
+        else: # GET request
             text = request.args.get("text", "")
+            # Allow overriding synthesis parameters via query string
+            req_args = {k: request.args.get(k, type=type(synthesis_defaults[k])) 
+                        for k in synthesis_defaults if k in request.args}
 
         text = text.strip()
         if not text:
-            raise ValueError("No text provided")
+            return "No text provided", 400
 
-        _LOGGER.debug("Synthesizing text: %s", text)
+        # Combine defaults with request-specific args, filtering out None values
+        current_synthesize_args = {**synthesis_defaults, **req_args}
+        current_synthesize_args = {k: v for k, v in current_synthesize_args.items() if v is not None}
+
+        _LOGGER.debug("Synthesizing (WAV) text: '%s' with args: %s", text, current_synthesize_args)
         with io.BytesIO() as wav_io:
+            # Use wave module to create a proper WAV header and structure
             with wave.open(wav_io, "wb") as wav_file:
-                voice.synthesize(text, wav_file, **synthesize_args)
+                voice.synthesize(text, wav_file, **current_synthesize_args)
+            
+            response_data = wav_io.getvalue()
 
-            return wav_io.getvalue()
+        return app.response_class(
+            response_data,
+            mimetype="audio/wav"
+        )
 
     @app.route("/stream", methods=["GET", "POST"])
     def app_synthesize_stream():
-        """Stream synthesized audio."""
+        """Stream synthesized audio as raw PCM."""
         if request.method == "POST":
-            text = request.data.decode("utf-8")
-        else:
+            # Prefer JSON body for POST for easier parameter passing
+            if request.is_json:
+                data = request.get_json()
+                text = data.get("text", "")
+                 # Allow overriding synthesis parameters via JSON
+                req_args = {k: data.get(k) for k in synthesis_defaults if k in data}
+            else:
+                text = request.data.decode("utf-8")
+                req_args = {} # No overrides from plain text body
+        else: # GET request
             text = request.args.get("text", "")
+             # Allow overriding synthesis parameters via query string
+            req_args = {k: request.args.get(k, type=type(synthesis_defaults[k])) 
+                        for k in synthesis_defaults if k in request.args}
 
         text = text.strip()
         if not text:
-            raise ValueError("No text provided")
+             return "No text provided", 400
 
-        _LOGGER.debug("Streaming synthesis for text: %s", text)
+        # Combine defaults with request-specific args, filtering out None values
+        current_synthesize_args = {**synthesis_defaults, **req_args}
+        current_synthesize_args = {k: v for k, v in current_synthesize_args.items() if v is not None}
+
+        _LOGGER.debug("Streaming (PCM) text: '%s' with args: %s", text, current_synthesize_args)
+
+        # Define the PCM format based on Piper's output (16-bit signed integer, mono)
+        # audio/L16 is a common MIME type for this. Parameters specify details.
+        # Piper produces Little Endian by default on common platforms via numpy.
+        pcm_format = (
+            f"audio/L16; "
+            f"rate={voice.config.sample_rate}; "
+            f"channels=1; "
+            # signed-integer is implied by L16, bits=16 implied by L16
+            # endianness=little is typical but less standard to include here
+        )
+
+        # Return the generator. Flask/Werkzeug handles Chunked Transfer Encoding.
         return app.response_class(
-            generate_audio_stream(text),
-            mimetype="audio/wav"
+            generate_pcm_stream(text, current_synthesize_args),
+            mimetype=pcm_format
         )
 
     app.run(host=args.host, port=args.port)

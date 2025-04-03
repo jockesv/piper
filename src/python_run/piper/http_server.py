@@ -102,6 +102,21 @@ def main() -> None:
     # Create web server
     app = Flask(__name__)
 
+    def generate_audio_stream(text: str):
+        """Generate streaming audio response."""
+        # Start with WAV header
+        with io.BytesIO() as wav_io:
+            with wave.open(wav_io, "wb") as wav_file:
+                wav_file.setframerate(voice.config.sample_rate)
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setnchannels(1)  # mono
+                wav_file.writeframes(b"")  # Write empty frames to generate header
+            yield wav_io.getvalue()
+        
+        # Stream audio data
+        for audio_bytes in voice.synthesize_stream_raw(text, **synthesize_args):
+            yield audio_bytes
+
     @app.route("/", methods=["GET", "POST"])
     def app_synthesize() -> bytes:
         if request.method == "POST":
@@ -119,6 +134,24 @@ def main() -> None:
                 voice.synthesize(text, wav_file, **synthesize_args)
 
             return wav_io.getvalue()
+
+    @app.route("/stream", methods=["GET", "POST"])
+    def app_synthesize_stream():
+        """Stream synthesized audio."""
+        if request.method == "POST":
+            text = request.data.decode("utf-8")
+        else:
+            text = request.args.get("text", "")
+
+        text = text.strip()
+        if not text:
+            raise ValueError("No text provided")
+
+        _LOGGER.debug("Streaming synthesis for text: %s", text)
+        return app.response_class(
+            generate_audio_stream(text),
+            mimetype="audio/wav"
+        )
 
     app.run(host=args.host, port=args.port)
 
